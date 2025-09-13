@@ -101,17 +101,21 @@ class YOLODetector(BaseDetector):
 class MediaPipeDetector(BaseDetector):
     """MediaPipe detector wrapper class with multi-person support"""
     
-    def __init__(self, confidence_threshold: float = 0.5, use_coco_format: bool = False, enable_multi_person: bool = True):
+    def __init__(self, confidence_threshold: float = 0.5, use_coco_format: bool = False, enable_multi_person: bool = True, 
+                 use_native_multi_person: bool = False, num_poses: int = 10):
         super().__init__(confidence_threshold)
         self.mp_pose = None
         self.pose = None
+        self.pose_landmarker = None
         self.use_coco_format = use_coco_format
         self.enable_multi_person = enable_multi_person
+        self.use_native_multi_person = use_native_multi_person
+        self.num_poses = num_poses
         self.yolo_detector = None
         self._initialize_mediapipe()
         
-        # Initialize YOLO for person detection if multi-person is enabled
-        if self.enable_multi_person:
+        # Initialize YOLO for person detection if multi-person is enabled and not using native
+        if self.enable_multi_person and not self.use_native_multi_person:
             self._initialize_yolo_for_detection()
     
     def toggle_keypoint_format(self):
@@ -133,22 +137,49 @@ class MediaPipeDetector(BaseDetector):
         try:
             import mediapipe as mp
             self.mp_pose = mp.solutions.pose
-            self.pose = self.mp_pose.Pose(
-                static_image_mode=False,
-                model_complexity=1,
-                enable_segmentation=False,  # Disable segmentation for multi-person to avoid size conflicts
-                min_detection_confidence=self.confidence_threshold,
-                min_tracking_confidence=0.5
-            )
+            
+            if self.use_native_multi_person:
+                # Use newer MediaPipe Tasks API with num_poses parameter
+                try:
+                    from mediapipe.tasks import python
+                    from mediapipe.tasks.python import vision
+                    
+                    # Create base options and PoseLandmarker options
+                    base_options = python.BaseOptions()
+                    options = vision.PoseLandmarkerOptions(
+                        base_options=base_options,
+                        running_mode=vision.RunningMode.VIDEO,
+                        num_poses=self.num_poses,
+                        min_pose_detection_confidence=self.confidence_threshold,
+                        min_pose_presence_confidence=0.5,
+                        min_tracking_confidence=0.5
+                    )
+                    self.pose_landmarker = vision.PoseLandmarker.create_from_options(options)
+                    print(f"Initialized MediaPipe native multi-person detection with num_poses={self.num_poses}")
+                except Exception as e:
+                    print(f"Warning: Could not initialize native multi-person MediaPipe: {e}")
+                    print("Falling back to standard MediaPipe Pose")
+                    self.use_native_multi_person = False
+            
+            if not self.use_native_multi_person:
+                # Standard MediaPipe Pose (single-person)
+                self.pose = self.mp_pose.Pose(
+                    static_image_mode=False,
+                    model_complexity=1,
+                    enable_segmentation=False,  # Disable segmentation for multi-person to avoid size conflicts
+                    min_detection_confidence=self.confidence_threshold,
+                    min_tracking_confidence=0.5
+                )
         except ImportError:
             raise ImportError("Please install mediapipe: pip install mediapipe")
     
     def detect(self, frame: np.ndarray) -> List[DetectionResult]:
         """Detect using MediaPipe with multi-person support"""
-        if not self.pose:
+        if self.use_native_multi_person and self.pose_landmarker:
+            return self._detect_native_multi_person(frame)
+        elif not self.pose:
             return []
-        
-        if self.enable_multi_person and self.yolo_detector:
+        elif self.enable_multi_person and self.yolo_detector:
             return self._detect_multi_person(frame)
         else:
             return self._detect_single_person(frame)
@@ -168,6 +199,45 @@ class MediaPipeDetector(BaseDetector):
             )
             if detection:
                 results.append(detection)
+        
+        return results
+    
+    def _detect_native_multi_person(self, frame: np.ndarray) -> List[DetectionResult]:
+        """Native MediaPipe multi-person detection using PoseLandmarker with num_poses"""
+        results = []
+        
+        try:
+            import mediapipe as mp
+            
+            # Convert frame to MediaPipe Image format
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            
+            # Get timestamp for video mode
+            timestamp_ms = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
+            
+            # Detect poses
+            detection_result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            
+            if detection_result.pose_landmarks:
+                for i, pose_landmarks in enumerate(detection_result.pose_landmarks):
+                    # Convert landmarks to our format
+                    landmarks_list = []
+                    for landmark in pose_landmarks:
+                        landmarks_list.append(landmark)
+                    
+                    detection = self._create_detection_from_landmarks(
+                        landmarks_list,
+                        frame.shape[:2],
+                        segmentation_mask=None,  # Native method doesn't provide segmentation
+                        person_id=i
+                    )
+                    if detection:
+                        results.append(detection)
+                        
+        except Exception as e:
+            print(f"Error in native multi-person detection: {e}")
+            return []
         
         return results
     
@@ -288,14 +358,21 @@ class MediaPipeDetector(BaseDetector):
         return detection
     
     def get_capabilities(self) -> dict:
+        model_type = 'MediaPipe'
+        if self.use_native_multi_person:
+            model_type += ' (Native Multi-Person)'
+        elif self.enable_multi_person:
+            model_type += ' + YOLO'
+            
         return {
             'bbox': True,
             'pose': True,
-            'segmentation': not self.enable_multi_person,  # Segmentation disabled for multi-person
-            'multi_person': self.enable_multi_person,
+            'segmentation': not self.enable_multi_person and not self.use_native_multi_person,  # Segmentation disabled for multi-person
+            'multi_person': self.enable_multi_person or self.use_native_multi_person,
             'keypoints_count': 17 if self.use_coco_format else 33,
-            'model_type': 'MediaPipe' + (' + YOLO' if self.enable_multi_person else ''),
-            'can_toggle_keypoints': True
+            'model_type': model_type,
+            'can_toggle_keypoints': True,
+            'native_multi_person': self.use_native_multi_person
         }
 
 
@@ -309,6 +386,12 @@ def create_detector(detector_type: str, **kwargs) -> BaseDetector:
         # Enable multi-person by default for MediaPipe
         if 'enable_multi_person' not in mediapipe_kwargs:
             mediapipe_kwargs['enable_multi_person'] = True
+        return MediaPipeDetector(**mediapipe_kwargs)
+    elif detector_type.lower() == 'mediapipe-native':
+        # MediaPipe with native multi-person detection
+        mediapipe_kwargs = {k: v for k, v in kwargs.items() if k != 'model_path'}
+        mediapipe_kwargs['use_native_multi_person'] = True
+        mediapipe_kwargs['enable_multi_person'] = True
         return MediaPipeDetector(**mediapipe_kwargs)
     else:
         raise ValueError(f"Unsupported detector type: {detector_type}")

@@ -10,12 +10,17 @@ class MultiModelHumanDetector:
     """Multi-model human detector supporting various models"""
     
     def __init__(self, detector_type='yolo', model_path='yolov8n.pt', confidence=0.5,
-                 show_bbox=True, show_mask=True, show_pose=True):
-        self.detector = create_detector(
-            detector_type, 
-            model_path=model_path if detector_type == 'yolo' else None,
-            confidence_threshold=confidence
-        )
+                 show_bbox=True, show_mask=True, show_pose=True, num_poses=10):
+        detector_kwargs = {
+            'confidence_threshold': confidence
+        }
+        
+        if detector_type == 'yolo':
+            detector_kwargs['model_path'] = model_path
+        elif detector_type == 'mediapipe-native':
+            detector_kwargs['num_poses'] = num_poses
+            
+        self.detector = create_detector(detector_type, **detector_kwargs)
         self.cap = None
         self.capabilities = self.detector.get_capabilities()
         
@@ -290,13 +295,15 @@ class MultiModelHumanDetector:
 
 def main():
     parser = argparse.ArgumentParser(description='Multi-model human detection and pose estimation')
-    parser.add_argument('--detector', choices=['yolo', 'mediapipe'], default='yolo',
-                       help='Choose detector type')
+    parser.add_argument('--detector', choices=['yolo', 'mediapipe', 'mediapipe-native'], default='yolo',
+                       help='Choose detector type (mediapipe-native uses MediaPipe num_poses for multi-person)')
     parser.add_argument('--model', default='yolov8n-seg.pt', 
                        help='YOLO model path (for YOLO detector only)')
     parser.add_argument('--confidence', type=float, default=0.5, 
                        help='Confidence threshold')
     parser.add_argument('--camera', type=int, default=0, help='Camera ID')
+    parser.add_argument('--num-poses', type=int, default=10,
+                       help='Maximum number of poses to detect (for mediapipe-native only)')
     
     # Visualization toggles
     parser.add_argument('--no-bbox', action='store_true', help='Start with bounding boxes disabled')
@@ -313,7 +320,8 @@ def main():
             confidence=args.confidence,
             show_bbox=not args.no_bbox,
             show_mask=not args.no_mask,
-            show_pose=not args.no_pose
+            show_pose=not args.no_pose,
+            num_poses=args.num_poses
         )
         
         detector.show_help = not args.no_help
