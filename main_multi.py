@@ -3,6 +3,7 @@ import numpy as np
 import argparse
 import sys
 from detectors import create_detector, convert_mediapipe_to_coco, DetectionResult
+from person_tracker import PersonTracker
 from typing import List
 
 
@@ -10,7 +11,7 @@ class MultiModelHumanDetector:
     """Multi-model human detector supporting various models"""
     
     def __init__(self, detector_type='yolo', model_path='yolov8n.pt', confidence=0.5,
-                 show_bbox=True, show_mask=True, show_pose=True, num_poses=10):
+                 show_bbox=True, show_mask=True, show_pose=True, num_poses=10, enable_tracking=True):
         detector_kwargs = {
             'confidence_threshold': confidence
         }
@@ -24,11 +25,24 @@ class MultiModelHumanDetector:
         self.cap = None
         self.capabilities = self.detector.get_capabilities()
         
+        # Initialize person tracker
+        self.enable_tracking = enable_tracking
+        if self.enable_tracking:
+            self.tracker = PersonTracker(
+                max_disappeared=10,
+                min_hits=3,
+                iou_threshold=0.3,
+                distance_threshold=0.7
+            )
+        else:
+            self.tracker = None
+        
         # Visualization toggles
         self.show_bbox = show_bbox
         self.show_mask = show_mask and self.capabilities['segmentation']
         self.show_pose = show_pose and self.capabilities['pose']
         self.show_help = True
+        self.show_tracking = enable_tracking
         
         # COCO pose connections (17 keypoints)
         self.coco_connections = [
@@ -195,6 +209,8 @@ class MultiModelHumanDetector:
             "  'm' - Toggle segmentation mask", 
             "  'p' - Toggle pose keypoints",
             "  'k' - Toggle keypoint format (MediaPipe only)",
+            "  't' - Toggle person tracking",
+            "  'r' - Reset tracker",
             "  'h' - Toggle help text",
             "  'q' - Exit"
         ]
@@ -206,6 +222,8 @@ class MultiModelHumanDetector:
             f"Segmentation mask: {'On' if self.show_mask else 'Off' if self.capabilities['segmentation'] else 'Unavailable'}",
             f"Pose: {'On' if self.show_pose else 'Off' if self.capabilities['pose'] else 'Unavailable'}",
             f"Multi-person: {'On' if self.capabilities['multi_person'] else 'Off'}",
+            f"Person tracking: {'On' if self.show_tracking else 'Off'}",
+            f"Active tracks: {self.tracker.get_active_track_count() if self.tracker else 0}",
             f"Keypoints count: {self.capabilities['keypoints_count']}"
         ]
         
@@ -251,6 +269,21 @@ class MultiModelHumanDetector:
                 print(f"Keypoint format switched to: {format_type}")
             else:
                 print("Current model doesn't support keypoint format toggle")
+        elif key == ord('t'):
+            self.show_tracking = not self.show_tracking
+            if self.show_tracking and not self.tracker:
+                # Reinitialize tracker if it was disabled
+                self.tracker = PersonTracker(
+                    max_disappeared=10,
+                    min_hits=3,
+                    iou_threshold=0.3,
+                    distance_threshold=0.7
+                )
+            print(f"Person tracking: {'On' if self.show_tracking else 'Off'}")
+        elif key == ord('r'):
+            if self.tracker:
+                self.tracker.reset()
+                print("Tracker reset - all track IDs cleared")
     
     def run(self):
         """Run detection"""
@@ -267,6 +300,10 @@ class MultiModelHumanDetector:
                 
                 # Detection
                 detections = self.detector.detect(frame)
+                
+                # Apply tracking if enabled
+                if self.show_tracking and self.tracker:
+                    detections = self.tracker.update(detections)
                 
                 # Draw results
                 annotated_frame = self.draw_detections(frame, detections)
@@ -309,6 +346,7 @@ def main():
     parser.add_argument('--no-bbox', action='store_true', help='Start with bounding boxes disabled')
     parser.add_argument('--no-mask', action='store_true', help='Start with segmentation masks disabled')
     parser.add_argument('--no-pose', action='store_true', help='Start with pose display disabled')
+    parser.add_argument('--no-tracking', action='store_true', help='Start with person tracking disabled')
     parser.add_argument('--no-help', action='store_true', help='Start with help text hidden')
     
     args = parser.parse_args()
@@ -321,7 +359,8 @@ def main():
             show_bbox=not args.no_bbox,
             show_mask=not args.no_mask,
             show_pose=not args.no_pose,
-            num_poses=args.num_poses
+            num_poses=args.num_poses,
+            enable_tracking=not args.no_tracking
         )
         
         detector.show_help = not args.no_help
